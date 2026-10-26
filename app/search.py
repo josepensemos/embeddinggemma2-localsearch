@@ -178,10 +178,10 @@ class State:
     never see the rows of one index with the vectors of another.
     """
 
-    __slots__ = ("folder", "dir", "items", "rows", "folded", "vectors", "stats")
+    __slots__ = ("folder", "dir", "items", "rows", "folded", "vectors", "stats", "generation")
 
     def __init__(self, folder: Path | None = None, directory: Path | None = None,
-                 items=(), rows=(), folded=(), vectors=None, stats=None) -> None:
+                 items=(), rows=(), folded=(), vectors=None, stats=None, generation: int = 0) -> None:
         self.folder = folder
         self.dir = directory
         self.items = list(items)
@@ -189,6 +189,7 @@ class State:
         self.folded = list(folded)  # fold() of each row's text, for exact code matching
         self.vectors = vectors
         self.stats = stats or {}
+        self.generation = generation  # changes whenever the index does; used as a cache key
 
 
 class Index:
@@ -235,6 +236,10 @@ class Index:
     def stats(self) -> dict:
         return self._state.stats
 
+    @property
+    def generation(self) -> int:
+        return self._state.generation
+
     # ---------------------------------------------------------- load
 
     def load(self, folder: Path) -> bool:
@@ -248,6 +253,7 @@ class Index:
             folder=folder, directory=d, items=data["items"], rows=data["rows"],
             folded=[fold(r.get("text", "")) for r in data["rows"]],
             vectors=np.load(d / "vectors.npy"), stats=data.get("stats", {}),
+            generation=(d / "index.json").stat().st_mtime_ns,
         )
         with self._lock:  # one assignment: no reader can catch it half done
             self._state = state
@@ -281,7 +287,8 @@ class Index:
         st = self._state
         if st.folder is None:
             return None
-        return {"folder": str(st.folder), "name": st.folder.name, "stats": st.stats}
+        return {"folder": str(st.folder), "name": st.folder.name, "stats": st.stats,
+                "generation": st.generation}
 
     # ---------------------------------------------------------- build
 
@@ -456,7 +463,8 @@ class Index:
 
     # ---------------------------------------------------------- search
 
-    def rank(self, q, n: int, kind: str = "all", exclude: int | None = None, text: str = "") -> list[dict]:
+    def rank(self, q, n: int, kind: str = "all", exclude: int | None = None, text: str = "",
+             state: State | None = None) -> list[dict]:
         """Ranks items by similarity to the query vector q.
 
         Text↔text and text↔image similarities live on different scales (the
@@ -468,7 +476,7 @@ class Index:
         """
         import numpy as np
 
-        st = self._state  # one snapshot for the whole ranking pass
+        st = state or self._state  # one snapshot for the whole ranking pass
         sims = st.vectors @ q.reshape(-1)
         is_text = np.array([r["kind"] == "text" for r in st.rows])
         z = np.empty_like(sims)
@@ -509,8 +517,8 @@ class Index:
             })
         return out
 
-    def image_vector(self, item: int):
-        st = self._state
+    def image_vector(self, item: int, state: State | None = None):
+        st = state or self._state
         for i, r in enumerate(st.rows):
             if r["item"] == item and r["kind"] == "image":
                 return st.vectors[i]
@@ -679,16 +687,22 @@ def make_handler(model: Model, index: Index):
                     if not self._can_search():
                         return
                     t0 = time.perf_counter()
+                    st = index.state()
                     v = model.embed_query(q.get("q", ""))
-                    res = index.rank(v, int(q.get("n", 24)), q.get("type", "all"), text=q.get("q", ""))
-                    return self._json({"ms": round((time.perf_counter() - t0) * 1000), "results": res})
+                    res = index.rank(v, int(q.get("n", 24)), q.get("type", "all"),
+                                     text=q.get("q", ""), state=st)
+                    return self._json({"ms": round((time.perf_counter() - t0) * 1000),
+                                       "generation": st.generation, "results": res})
                 if u.path == "/similar":
                     if not self._can_search():
                         return
                     t0 = time.perf_counter()
+                    st = index.state()
                     it = int(q["id"])
-                    res = index.rank(index.image_vector(it), int(q.get("n", 24)), q.get("type", "all"), exclude=it)
-                    return self._json({"ms": round((time.perf_counter() - t0) * 1000), "results": res})
+                    res = index.rank(index.image_vector(it, st), int(q.get("n", 24)),
+                                     q.get("type", "all"), exclude=it, state=st)
+                    return self._json({"ms": round((time.perf_counter() - t0) * 1000),
+                                       "generation": st.generation, "results": res})
                 self._json({"error": "not found"}, 404)
             except (KeyError, IndexError, ValueError) as e:
                 self._json({"error": str(e)}, 400)
@@ -738,8 +752,10 @@ def make_handler(model: Model, index: Index):
                         for tmp in (f.name, jpg):
                             if os.path.exists(tmp):
                                 os.unlink(tmp)
-                    res = index.rank(v, 24, parse_qs(u.query).get("type", ["all"])[0])
-                    return self._json({"ms": round((time.perf_counter() - t0) * 1000), "results": res})
+                    st = index.state()
+                    res = index.rank(v, 24, parse_qs(u.query).get("type", ["all"])[0], state=st)
+                    return self._json({"ms": round((time.perf_counter() - t0) * 1000),
+                                       "generation": st.generation, "results": res})
                 if u.path in ("/open", "/reveal"):
                     st = index.state()
                     it = st.items[int(json.loads(self._body())["id"])]

@@ -223,7 +223,7 @@ body.scores .name .sim{display:inline}
 <script>
 const $ = s => document.querySelector(s);
 const views = {start: $('#viewStart'), index: $('#viewIndex'), search: $('#viewSearch')};
-let status = {}, type = 'all', last = null, pendingFolder = null, results = [], opened = null;
+let status = {}, type = 'all', last = null, pendingFolder = null, results = [], opened = null, gen = 0;
 
 function show(name){ for (const k in views) views[k].classList.toggle('hidden', k !== name); }
 const fmtTime = s => s < 60 ? `${Math.round(s)} s` : `${Math.floor(s/60)} min ${String(Math.round(s%60)).padStart(2,'0')} s`;
@@ -325,6 +325,7 @@ async function run(url, opts){
   try {
     const d = await api(url, opts);
     results = d.results;
+    if (d.generation) gen = d.generation;  // cache key: it changes when the index does
     paint(d.results);
     $('#info').textContent = `${d.results.length} results · ${d.ms} ms`;
   } catch(e){ $('#info').textContent = e.message; }
@@ -366,7 +367,7 @@ function paint(list){
   if (!list.length){ g.innerHTML = '<div class="empty">Nothing here</div>'; return; }
   g.innerHTML = list.map((r,k) => `
     <article class="card ${r.type} ${k===0?'first':''}" data-k="${k}" style="animation-delay:${Math.min(k,12)*25}ms">
-      <div class="thumb"><img src="/thumb/${r.id}" loading="lazy" alt=""><div class="tags">${tags(r)}</div></div>
+      <div class="thumb"><img src="/thumb/${r.id}?v=${gen}" loading="lazy" alt=""><div class="tags">${tags(r)}</div></div>
       <div class="foot">
         <div class="name"><span>${esc(r.name)}</span><span class="sim">${r.similarity.toFixed(2)}</span></div>
         ${r.snippet ? `<div class="snippet">${highlight(excerpt(r.snippet))}</div>` : ''}
@@ -398,7 +399,7 @@ function searchWithImage(file){
 function similar(id, name){
   last = {mode:'similar', id, name};
   $('#queryImage').classList.remove('hidden');
-  $('#queryImageSrc').src = `/thumb/${id}`;
+  $('#queryImageSrc').src = `/thumb/${id}?v=${gen}`;
   $('#queryImageText').textContent = `Similar to ${name}`;
   $('#q').value = '';
   run(`/similar?id=${id}&type=${type}&n=24`);
@@ -419,8 +420,8 @@ addEventListener('drop', e => {
 function openViewer(r){
   opened = r;
   $('#canvas').innerHTML = r.type === 'pdf'
-    ? `<iframe src="/file/${r.id}#page=${r.page}&view=FitH&toolbar=0"></iframe>`
-    : `<img src="/file/${r.id}" alt="">`;
+    ? `<iframe src="/file/${r.id}?v=${gen}#page=${r.page}&view=FitH&toolbar=0"></iframe>`
+    : `<img src="/file/${r.id}?v=${gen}" alt="">`;
   $('#vName').textContent = r.name + (r.type === 'pdf' ? ` · page ${r.page}` : '');
   $('#vPath').textContent = r.rel;
   const sn = $('#vSnippet');
