@@ -16,11 +16,12 @@ def unit(cosine: float) -> np.ndarray:
 def make_index(items, rows, vectors, folder: str = "/tmp/folder") -> search.Index:
     """An Index holding the given items and rows, with nothing on disk."""
     index = search.Index()
+    root = Path(folder)
     index.install(search.State(
-        folder=Path(folder), directory=Path(folder), items=items, rows=rows,
+        folder=root, directory=root, items=items, rows=rows,
         folded=[search.fold(row.get("text", "")) for row in rows],
         vectors=np.asarray(vectors, dtype="float32"),
-        stats={"date": "2026-10-26 09:00"},
+        stats={"date": "2026-10-26 09:00"}, generation=1, thumbs=root / "thumbs",
     ))
     return index
 

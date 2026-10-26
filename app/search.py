@@ -131,6 +131,13 @@ def index_dir(folder: Path) -> Path:
     return INDEXES / hashlib.sha1(str(folder).encode()).hexdigest()[:12]
 
 
+def write_atomic(path: Path, text: str) -> None:
+    """Writes beside the target and renames over it: a reader never sees half a file."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def chunk_text(text: str) -> list[str]:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{2,}", "\n", text).strip()
@@ -180,10 +187,11 @@ class State:
     never see the rows of one index with the vectors of another.
     """
 
-    __slots__ = ("folder", "dir", "items", "rows", "folded", "vectors", "stats", "generation")
+    __slots__ = ("folder", "dir", "items", "rows", "folded", "vectors", "stats", "generation", "thumbs")
 
     def __init__(self, folder: Path | None = None, directory: Path | None = None,
-                 items=(), rows=(), folded=(), vectors=None, stats=None, generation: int = 0) -> None:
+                 items=(), rows=(), folded=(), vectors=None, stats=None, generation: int = 0,
+                 thumbs: Path | None = None) -> None:
         self.folder = folder
         self.dir = directory
         self.items = list(items)
@@ -192,6 +200,7 @@ class State:
         self.vectors = vectors
         self.stats = stats or {}
         self.generation = generation  # changes whenever the index does; used as a cache key
+        self.thumbs = thumbs  # this build's thumbnail directory, never shared with another build
 
 
 class Index:
@@ -247,20 +256,30 @@ class Index:
     def generation(self) -> int:
         return self._state.generation
 
+    @property
+    def thumbs(self) -> Path | None:
+        return self._state.thumbs
+
     # ---------------------------------------------------------- load
 
     def load(self, folder: Path) -> bool:
         import numpy as np
 
         d = index_dir(folder)
-        if not (d / "vectors.npy").exists():
+        d = index_dir(folder)
+        if not (d / "index.json").exists():
             return False
         data = json.loads((d / "index.json").read_text(encoding="utf-8"))
+        vectors = d / data.get("vectors_file", "vectors.npy")
+        if not vectors.exists():
+            return False
         state = State(
             folder=folder, directory=d, items=data["items"], rows=data["rows"],
             folded=[fold(r.get("text", "")) for r in data["rows"]],
-            vectors=np.load(d / "vectors.npy"), stats=data.get("stats", {}),
-            generation=(d / "index.json").stat().st_mtime_ns,
+            vectors=np.load(vectors), stats=data.get("stats", {}),
+            # Older indexes have no generation, thumbnail directory or vectors file of their own.
+            generation=int(data.get("generation") or (d / "index.json").stat().st_mtime_ns),
+            thumbs=d / data.get("thumbs_dir", "thumbs"),
         )
         self.install(state)  # one assignment: no reader can catch it half done
         return True
@@ -275,7 +294,7 @@ class Index:
 
         try:
             data = json.loads((d / "index.json").read_text(encoding="utf-8"))
-            vectors = np.load(d / "vectors.npy")
+            vectors = np.load(d / data.get("vectors_file", "vectors.npy"))
         except (OSError, ValueError):
             return {}
         if data.get("settings") != settings():
@@ -318,9 +337,11 @@ class Index:
         try:
             d = index_dir(folder)
             old = self.previous(d)
-            # New thumbnails go to a separate folder, swapped in at the end: the old
-            # ones are still needed to copy the thumbnails of unchanged files.
-            thumbs = d / "thumbs.new"
+            # This build gets its own thumbnail directory: the index in use keeps serving
+            # its own files until the new state is installed, and only then is it removed.
+            old_thumbs = self._state.thumbs or (d / "thumbs")
+            generation = time.time_ns()
+            thumbs = d / f"thumbs-{generation}"
             shutil.rmtree(thumbs, ignore_errors=True)
             thumbs.mkdir(parents=True)
             files = find_files(folder)
@@ -352,11 +373,11 @@ class Index:
             def reuse(f: Path, s: dict) -> int:
                 """Takes the items of an unchanged file from the previous index. Returns how many."""
                 prev = old.get((rel(f), s["size"], s["mtime"]), [])
-                if not all((d / "thumbs" / it["thumb"]).exists() for it, _ in prev):
+                if not all((old_thumbs / it["thumb"]).exists() for it, _ in prev):
                     return 0
                 for it, its_rows in prev:
                     k = len(items)
-                    shutil.copyfile(d / "thumbs" / it["thumb"], thumbs / f"{k:05d}.jpg")
+                    shutil.copyfile(old_thumbs / it["thumb"], thumbs / f"{k:05d}.jpg")
                     items.append({**it, "path": str(f), "thumb": f"{k:05d}.jpg"})
                     for row, vector in its_rows:
                         reused_rows.append({**row, "item": k})
@@ -453,14 +474,22 @@ class Index:
                 "peak_ram_gb": round(peak / 1e9, 1) if peak else None,
                 "machine": machine(),
             }
-            shutil.rmtree(d / "thumbs", ignore_errors=True)
-            thumbs.rename(d / "thumbs")
-            np.save(d / "vectors.npy", vectors)
-            (d / "index.json").write_text(json.dumps(
-                {"folder": str(folder), "settings": settings(), "items": items, "rows": rows, "stats": stats},
-                ensure_ascii=False), encoding="utf-8")
+            np.save(d / f"vectors-{generation}.npy", vectors)
+            write_atomic(d / "index.json", json.dumps(
+                {"folder": str(folder), "settings": settings(), "items": items, "rows": rows, "stats": stats,
+                 "generation": generation, "thumbs_dir": thumbs.name,
+                 "vectors_file": f"vectors-{generation}.npy"},
+                ensure_ascii=False))
             (INDEXES / "last.txt").write_text(str(folder), encoding="utf-8")
-            self.load(folder)
+            self.load(folder)  # the swap: from here on, all readers use the new files
+            keep = {thumbs, d / f"vectors-{generation}.npy"}
+            for stale in [*d.glob("thumbs*"), *d.glob("vectors*.npy")]:
+                if stale in keep:
+                    continue
+                if stale.is_dir():
+                    shutil.rmtree(stale, ignore_errors=True)
+                else:
+                    stale.unlink(missing_ok=True)
             p.update(phase="Done", active=False, current="", done=p["total"])
             print(json.dumps(stats, ensure_ascii=False, indent=1))
         except Exception as e:
@@ -718,13 +747,13 @@ def make_handler(model: Model, index: Index):
                 if u.path.startswith("/thumb/"):
                     st = index.state()
                     it = st.items[int(u.path.rsplit("/", 1)[1])]
-                    return self._file(st.dir / "thumbs" / it["thumb"], "image/jpeg")
+                    return self._file(st.thumbs / it["thumb"], "image/jpeg")
                 if u.path.startswith("/file/"):
                     st = index.state()
                     it = st.items[int(u.path.rsplit("/", 1)[1])]
                     if it["type"] == "pdf":
                         return self._file(Path(it["path"]), "application/pdf")
-                    return self._file(st.dir / "thumbs" / it["thumb"], "image/jpeg")
+                    return self._file(st.thumbs / it["thumb"], "image/jpeg")
                 if u.path == "/search":
                     if not self._can_search():
                         return
