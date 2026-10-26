@@ -171,6 +171,26 @@ def codes(query: str) -> list[str]:
     return [w for w in words if len(w) >= 3 and any(c.isdigit() for c in w)]
 
 
+class State:
+    """One complete view of an index: a rebuild replaces it whole, never field by field.
+
+    Readers take it once (`index.state()`) and work from that object, so a search can
+    never see the rows of one index with the vectors of another.
+    """
+
+    __slots__ = ("folder", "dir", "items", "rows", "folded", "vectors", "stats")
+
+    def __init__(self, folder: Path | None = None, directory: Path | None = None,
+                 items=(), rows=(), folded=(), vectors=None, stats=None) -> None:
+        self.folder = folder
+        self.dir = directory
+        self.items = list(items)
+        self.rows = list(rows)  # {"item": item id, "kind": "image"|"text", "text": chunk}
+        self.folded = list(folded)  # fold() of each row's text, for exact code matching
+        self.vectors = vectors
+        self.stats = stats or {}
+
+
 class Index:
     """An indexed folder: items (a photo or a PDF page) and their vectors.
 
@@ -179,14 +199,41 @@ class Index:
     """
 
     def __init__(self) -> None:
-        self.folder: Path | None = None
-        self.dir: Path | None = None
-        self.items: list[dict] = []
-        self.rows: list[dict] = []  # {"item": item id, "kind": "image"|"text", "text": chunk}
-        self.folded: list[str] = []  # fold() of each row's text, for exact code matching
-        self.vectors = None
-        self.stats: dict = {}
+        self._lock = threading.Lock()
+        self._state = State()
         self.progress: dict = {"active": False}
+
+    # ---------------------------------------------------------- state
+
+    def state(self) -> State:
+        """The live index. Take it once per request instead of reading the properties below."""
+        return self._state
+
+    # Convenience readers for one-shot uses (a summary, a menu entry). Never combine
+    # two of them: a rebuild can swap the state between the two reads.
+    @property
+    def folder(self) -> Path | None:
+        return self._state.folder
+
+    @property
+    def dir(self) -> Path | None:
+        return self._state.dir
+
+    @property
+    def items(self) -> list[dict]:
+        return self._state.items
+
+    @property
+    def rows(self) -> list[dict]:
+        return self._state.rows
+
+    @property
+    def vectors(self):
+        return self._state.vectors
+
+    @property
+    def stats(self) -> dict:
+        return self._state.stats
 
     # ---------------------------------------------------------- load
 
@@ -197,11 +244,13 @@ class Index:
         if not (d / "vectors.npy").exists():
             return False
         data = json.loads((d / "index.json").read_text(encoding="utf-8"))
-        self.folder, self.dir = folder, d
-        self.items, self.rows = data["items"], data["rows"]
-        self.folded = [fold(r.get("text", "")) for r in self.rows]
-        self.stats = data.get("stats", {})
-        self.vectors = np.load(d / "vectors.npy")
+        state = State(
+            folder=folder, directory=d, items=data["items"], rows=data["rows"],
+            folded=[fold(r.get("text", "")) for r in data["rows"]],
+            vectors=np.load(d / "vectors.npy"), stats=data.get("stats", {}),
+        )
+        with self._lock:  # one assignment: no reader can catch it half done
+            self._state = state
         return True
 
     @staticmethod
@@ -229,9 +278,10 @@ class Index:
         return old
 
     def summary(self) -> dict | None:
-        if self.folder is None:
+        st = self._state
+        if st.folder is None:
             return None
-        return {"folder": str(self.folder), "name": self.folder.name, "stats": self.stats}
+        return {"folder": str(st.folder), "name": st.folder.name, "stats": st.stats}
 
     # ---------------------------------------------------------- build
 
@@ -418,8 +468,9 @@ class Index:
         """
         import numpy as np
 
-        sims = self.vectors @ q.reshape(-1)
-        is_text = np.array([r["kind"] == "text" for r in self.rows])
+        st = self._state  # one snapshot for the whole ranking pass
+        sims = st.vectors @ q.reshape(-1)
+        is_text = np.array([r["kind"] == "text" for r in st.rows])
         z = np.empty_like(sims)
         for mask in (is_text, ~is_text):
             if mask.any():
@@ -427,14 +478,14 @@ class Index:
                 z[mask] = (v - v.mean()) / (v.std() + 1e-6)
         for code in codes(text):
             pattern = re.compile(rf"(?<![a-z0-9]){re.escape(code)}(?![a-z0-9])")
-            hits = [i for i, t in enumerate(self.folded) if t and pattern.search(t)]
+            hits = [i for i, t in enumerate(st.folded) if t and pattern.search(t)]
             # A code found nearly everywhere ("2026") is a year or a date, not an identifier.
             if len(hits) <= max(3, int(is_text.sum()) // 20):
                 z[hits] += CODE_BOOST
 
         best: dict[int, tuple[float, int]] = {}
         best_text: dict[int, int] = {}  # most similar text chunk of each page, for the snippet
-        for i, r in enumerate(self.rows):
+        for i, r in enumerate(st.rows):
             it = r["item"]
             if it == exclude:
                 continue
@@ -444,24 +495,25 @@ class Index:
                 best_text[it] = i
 
         def keep(it: int) -> bool:
-            return kind == "all" or self.items[it]["type"] == kind
+            return kind == "all" or st.items[it]["type"] == kind
 
         order = sorted((it for it in best if keep(it)), key=lambda it: -best[it][0])[:n]
         out = []
         for it in order:
             score, row = best[it]
             out.append({
-                "id": it, **{k: v for k, v in self.items[it].items() if k != "path"},
-                "matched_by": self.rows[row]["kind"], "z": round(score, 2),
-                "snippet": self.rows[best_text[it]]["text"] if it in best_text else "",
+                "id": it, **{k: v for k, v in st.items[it].items() if k != "path"},
+                "matched_by": st.rows[row]["kind"], "z": round(score, 2),
+                "snippet": st.rows[best_text[it]]["text"] if it in best_text else "",
                 "similarity": round(float(sims[row]), 3),
             })
         return out
 
     def image_vector(self, item: int):
-        for i, r in enumerate(self.rows):
+        st = self._state
+        for i, r in enumerate(st.rows):
             if r["item"] == item and r["kind"] == "image":
-                return self.vectors[i]
+                return st.vectors[i]
         raise KeyError(item)
 
 
@@ -614,13 +666,15 @@ def make_handler(model: Model, index: Index):
                         "online": online(), "index": index.summary(), "progress": pr,
                     })
                 if u.path.startswith("/thumb/"):
-                    it = index.items[int(u.path.rsplit("/", 1)[1])]
-                    return self._file(index.dir / "thumbs" / it["thumb"], "image/jpeg")
+                    st = index.state()
+                    it = st.items[int(u.path.rsplit("/", 1)[1])]
+                    return self._file(st.dir / "thumbs" / it["thumb"], "image/jpeg")
                 if u.path.startswith("/file/"):
-                    it = index.items[int(u.path.rsplit("/", 1)[1])]
+                    st = index.state()
+                    it = st.items[int(u.path.rsplit("/", 1)[1])]
                     if it["type"] == "pdf":
                         return self._file(Path(it["path"]), "application/pdf")
-                    return self._file(index.dir / "thumbs" / it["thumb"], "image/jpeg")
+                    return self._file(st.dir / "thumbs" / it["thumb"], "image/jpeg")
                 if u.path == "/search":
                     if not self._can_search():
                         return
@@ -687,7 +741,8 @@ def make_handler(model: Model, index: Index):
                     res = index.rank(v, 24, parse_qs(u.query).get("type", ["all"])[0])
                     return self._json({"ms": round((time.perf_counter() - t0) * 1000), "results": res})
                 if u.path in ("/open", "/reveal"):
-                    it = index.items[int(json.loads(self._body())["id"])]
+                    st = index.state()
+                    it = st.items[int(json.loads(self._body())["id"])]
                     open_with_system(it["path"], reveal=u.path == "/reveal")
                     return self._json({"ok": True})
                 self._json({"error": "not found"}, 404)
