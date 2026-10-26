@@ -210,6 +210,11 @@ class Index:
         """The live index. Take it once per request instead of reading the properties below."""
         return self._state
 
+    def install(self, state: State) -> None:
+        """Replaces the live index in one assignment: readers see the old one or the new one."""
+        with self._lock:
+            self._state = state
+
     # Convenience readers for one-shot uses (a summary, a menu entry). Never combine
     # two of them: a rebuild can swap the state between the two reads.
     @property
@@ -255,8 +260,7 @@ class Index:
             vectors=np.load(d / "vectors.npy"), stats=data.get("stats", {}),
             generation=(d / "index.json").stat().st_mtime_ns,
         )
-        with self._lock:  # one assignment: no reader can catch it half done
-            self._state = state
+        self.install(state)  # one assignment: no reader can catch it half done
         return True
 
     @staticmethod
