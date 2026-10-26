@@ -45,6 +45,8 @@ CHUNK = 700         # characters per PDF text chunk
 OVERLAP = 120       # overlap between consecutive chunks
 SKIP_DIRS = {"node_modules", "__pycache__"}  # never indexed, like hidden folders (.git, .venv…)
 CODE_BOOST = 5.0    # z-score bonus for a text chunk containing a code from the query verbatim
+MAX_UPLOAD = 25 * 1024 * 1024  # largest POST body we accept (an uploaded image)
+MAX_PIXELS = 120_000_000       # refuse to decode an image bigger than this (~360 MB of RGB)
 
 
 # ------------------------------------------------------------------ model
@@ -634,8 +636,44 @@ def make_handler(model: Model, index: Index):
             self.end_headers()
             self.wfile.write(body)
 
-        def _body(self) -> bytes:
-            return self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        def _body(self, limit: int = MAX_UPLOAD) -> bytes | None:
+            """The request body, or None after answering 400/413 when it cannot be accepted."""
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                self._json({"error": "invalid Content-Length"}, 400)
+                return None
+            if length < 0 or length > limit:
+                self._too_large(limit)
+                return None
+            return self.rfile.read(length)
+
+        def _too_large(self, limit: int) -> None:
+            # The rest of the body is still on its way: never parse it as a new request.
+            self.close_connection = True
+            self._json({"error": f"body larger than {limit} bytes"}, 413)
+
+        def _receive_to(self, dest: Path, limit: int = MAX_UPLOAD) -> bool:
+            """Streams the body into dest in chunks. False means the answer was already sent."""
+            try:
+                remaining = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                self._json({"error": "invalid Content-Length"}, 400)
+                return False
+            if remaining <= 0:
+                self._json({"error": "empty body"}, 400)
+                return False
+            if remaining > limit:
+                self._too_large(limit)
+                return False
+            with open(dest, "wb") as f:
+                while remaining:
+                    block = self.rfile.read(min(65536, remaining))
+                    if not block:  # the client hung up mid-body
+                        return False
+                    f.write(block)
+                    remaining -= len(block)
+            return True
 
         def _can_search(self) -> bool:
             if not model.ready():
@@ -722,7 +760,10 @@ def make_handler(model: Model, index: Index):
                     except NoDialog:
                         return self._json({"manual": True})
                 if u.path == "/index":
-                    data = json.loads(self._body() or b"{}")
+                    body = self._body()
+                    if body is None:
+                        return
+                    data = json.loads(body or b"{}")
                     folder = Path(data["folder"]).expanduser().resolve()
                     if not folder.is_dir():
                         return self._json({"error": "That folder does not exist"}, 400)
@@ -744,25 +785,37 @@ def make_handler(model: Model, index: Index):
 
                     t0 = time.perf_counter()
                     with tempfile.NamedTemporaryFile(suffix=".img", delete=False) as f:
-                        f.write(self._body())
-                    jpg = f.name + ".jpg"
+                        raw = Path(f.name)
+                    jpg = raw.with_suffix(".jpg")
                     try:
-                        with Image.open(f.name) as im:
+                        if not self._receive_to(raw):
+                            return  # 400/413 already answered
+                        try:
+                            with Image.open(raw) as im:
+                                im.verify()  # cheap: reads headers, not pixels
+                        except Exception:
+                            return self._json({"error": "that is not an image"}, 400)
+                        with Image.open(raw) as im:
+                            if im.width * im.height > MAX_PIXELS:
+                                return self._json({"error": "image too large to decode"}, 413)
                             im = ImageOps.exif_transpose(im).convert("RGB")
                             im.thumbnail((IMAGE_SIDE, IMAGE_SIDE))
                             im.save(jpg, "JPEG", quality=88)
-                        v = model.embed_images([jpg])[0]
+                        st = index.state()
+                        v = model.embed_images([str(jpg)])[0]
+                        res = index.rank(v, 24, parse_qs(u.query).get("type", ["all"])[0], state=st)
+                        return self._json({"ms": round((time.perf_counter() - t0) * 1000),
+                                           "generation": st.generation, "results": res})
                     finally:  # also when the upload isn't an image
-                        for tmp in (f.name, jpg):
-                            if os.path.exists(tmp):
-                                os.unlink(tmp)
-                    st = index.state()
-                    res = index.rank(v, 24, parse_qs(u.query).get("type", ["all"])[0], state=st)
-                    return self._json({"ms": round((time.perf_counter() - t0) * 1000),
-                                       "generation": st.generation, "results": res})
+                        for tmp in (raw, jpg):
+                            if tmp.exists():
+                                tmp.unlink()
                 if u.path in ("/open", "/reveal"):
+                    body = self._body()
+                    if body is None:
+                        return
                     st = index.state()
-                    it = st.items[int(json.loads(self._body())["id"])]
+                    it = st.items[int(json.loads(body)["id"])]
                     open_with_system(it["path"], reveal=u.path == "/reveal")
                     return self._json({"ok": True})
                 self._json({"error": "not found"}, 404)
