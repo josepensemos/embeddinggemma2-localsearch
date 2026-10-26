@@ -114,6 +114,16 @@ pip install -r requirements.txt
 
 For an NVIDIA GPU, install the CUDA build of PyTorch first (see [pytorch.org](https://pytorch.org/get-started/locally/)), then `pip install -r requirements.txt`.
 
+### Tests
+
+The chunking and ranking helpers have a suite that needs no model, no download and no GPU: it
+fakes the encoder, so it runs in a few seconds.
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
 ### What gets installed
 
 | Package | Why |
