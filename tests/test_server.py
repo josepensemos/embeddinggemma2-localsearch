@@ -139,3 +139,17 @@ def test_a_body_without_a_numeric_length_is_a_400(served):
     status, payload = call(served, "POST", "/index", body=b"{}", headers={"Content-Length": "abc"})
     assert status == 400
     assert payload["error"] == "invalid Content-Length"
+
+
+def test_an_image_pil_refuses_as_a_decompression_bomb_is_a_413(served, monkeypatch):
+    def boom(*args, **kwargs):
+        raise Image.DecompressionBombError("too many pixels")
+
+    monkeypatch.setattr(Image, "open", boom)
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(buffer, "JPEG")
+
+    status, payload = call(served, "POST", "/search-image", body=buffer.getvalue())
+
+    assert status == 413
+    assert payload["error"] == "image too large to decode"

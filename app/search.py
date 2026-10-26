@@ -822,14 +822,17 @@ def make_handler(model: Model, index: Index):
                         try:
                             with Image.open(raw) as im:
                                 im.verify()  # cheap: reads headers, not pixels
+                            with Image.open(raw) as im:
+                                if im.width * im.height > MAX_PIXELS:
+                                    return self._json({"error": "image too large to decode"}, 413)
+                                im = ImageOps.exif_transpose(im).convert("RGB")
+                                im.thumbnail((IMAGE_SIDE, IMAGE_SIDE))
+                                im.save(jpg, "JPEG", quality=88)
+                        except Image.DecompressionBombError:
+                            # PIL refuses on its own above twice MAX_IMAGE_PIXELS: same answer.
+                            return self._json({"error": "image too large to decode"}, 413)
                         except Exception:
                             return self._json({"error": "that is not an image"}, 400)
-                        with Image.open(raw) as im:
-                            if im.width * im.height > MAX_PIXELS:
-                                return self._json({"error": "image too large to decode"}, 413)
-                            im = ImageOps.exif_transpose(im).convert("RGB")
-                            im.thumbnail((IMAGE_SIDE, IMAGE_SIDE))
-                            im.save(jpg, "JPEG", quality=88)
                         st = index.state()
                         v = model.embed_images([str(jpg)])[0]
                         res = index.rank(v, 24, parse_qs(u.query).get("type", ["all"])[0], state=st)
